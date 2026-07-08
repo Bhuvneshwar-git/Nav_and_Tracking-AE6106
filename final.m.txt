@@ -1,0 +1,570 @@
+clc;
+rng("default");
+
+Tk          = 2;              
+sigma_r     = 250;                    
+sigma_theta = 1 * pi/180;             
+sigma_r_dot = 3;                       
+sigma_w     = 9.81 / sqrt(Tk);        
+L           = 300 * 1000/3600;         
+lambda      = exp(-(sigma_theta^2)/2); 
+v0          = 800 * 1000/3600;
+
+F = [1, Tk, 0,  0;
+     0,  1, 0,  0;
+     0,  0, 1, Tk;
+     0,  0, 0,  1];
+
+G = [Tk^2/2,      0;
+     Tk,          0;
+     0,      Tk^2/2;
+     0,          Tk];
+
+Q = diag([sigma_w^2, sigma_w^2]);
+
+n1 = 45;
+n2 = 6;
+n3 = 13;
+n4 = 6;
+n5 = 30;
+N = n1 + n2 + n3 + n4 + n5;
+
+function out = Rk(xk, lambda, sigma_r, sigma_r_dot)
+    x_p = xk(1);
+    y_p = xk(3);
+    
+    r2 = x_p^2 + y_p^2;
+    theta_p = atan2(y_p, x_p);
+    cos_t = cos(theta_p);       sin_t = sin(theta_p);
+    cos_2t = cos(2*theta_p);    sin_2t = sin(2*theta_p);
+    
+    term1 = (lambda^-2 - 2) * r2;
+    term2 = r2 + sigma_r^2;
+    var_x = term1 * cos_t^2 + term2 * (1 + lambda^4 * cos_2t)/2;
+    var_y = term1 * sin_t^2 + term2 * (1 - lambda^4 * cos_2t)/2;
+    cov_xy = term1 * cos_t * sin_t + term2 * lambda^4 * sin_2t / 2;
+    
+    R_p = [var_x, cov_xy, 0; cov_xy, var_y, 0; 0, 0, sigma_r_dot^2];
+    out = (R_p + R_p') / 2;
+end
+
+syms x_k y_k x_kDot y_kDot
+hx = [x_k;
+      y_k;
+      (x_k*x_kDot + y_k*y_kDot)/sqrt(x_k^2 + y_k^2)];
+
+vars = [x_k; x_kDot; y_k; y_kDot]; 
+
+Hx = jacobian(hx, vars);
+H = double(subs(Hx, vars, [0; 0; 60000; -800*(5/18)]));
+
+H_func  = matlabFunction(Hx, 'Vars', {vars});
+hx_func = matlabFunction(hx, 'Vars', {vars});
+
+x_true = zeros(4, N+1);
+z_true = NaN(3, N+1);
+
+x_0 = [0; 0; 60000; -v0];
+x_true(:,1) = x_0;
+
+function Fk = get_Fk(k, Tk, v0)
+
+    omega = 3 * 9.81 / v0; 
+    
+    e1 = 45; e2 = 51; e3 = 64; e4 = 70;
+    
+    if k <= e1
+        w = 0;              % Phase 1: Straight
+    elseif k <= e2
+        w = -omega;         % Phase 2: Right turn (Clockwise)
+    elseif k <= e3
+        w = 0;              % Phase 3: Straight
+    elseif k <= e4
+        w = omega;          % Phase 4: Left turn (Counter-Clockwise)
+    else
+        w = 0;              % Phase 5: Straight
+    end
+    
+    if abs(w) < 1e-6
+        Fk = [1, Tk, 0,  0;
+             0,  1, 0,  0;
+             0,  0, 1, Tk;
+             0,  0, 0,  1];
+    else
+        Fk = [1, sin(w*Tk)/w,        0, -(1-cos(w*Tk))/w;
+              0, cos(w*Tk),          0, -sin(w*Tk);
+              0, (1-cos(w*Tk))/w,    1,  sin(w*Tk)/w;
+              0, sin(w*Tk),          0,  cos(w*Tk)];
+    end
+end
+
+
+for k = 2:N+1
+    Fk = get_Fk(k-1, Tk, v0);
+    x_true(:,k) = Fk * x_true(:,k-1);    
+
+    hx_k = hx_func(x_true(:,k));
+    
+    if abs(hx_k(3)) >= L
+        R = Rk(x_true(:,k), lambda, sigma_r, sigma_r_dot);
+        noise = mvnrnd(zeros(3,1), R);
+        z_true(:,k) = hx_k + noise';
+    end
+end
+
+
+
+% Linearized Kalman Filter
+
+x_lkf = zeros(4, N+1);
+P_lkf = zeros(4, 4, N+1);
+innovation_lkf = NaN(3, N+1);
+sr_est_lkf = zeros(1, N+1);
+sr_updated_lkf = zeros(1, N+1);
+nees_lkf = zeros(1, N+1);
+
+x_lkf(:,1) = 0.95*[0;   0;   60000;    -800*(5/18)];
+P_lkf(:,:,1) = eye(4);
+sr_est_lkf(:,1) = abs(max(eig(P_lkf(:,:,1))));
+sr_updated_lkf(:,1) = abs(max(eig(P_lkf(:,:,1))));
+
+for k = 2:N+1
+    x_est = F * x_lkf(:,k-1);
+    P_est = F * P_lkf(:,:,k-1) * F' + G * Q * G';
+    sr_est_lkf(:,k) = abs(max(eig(P_est)));
+
+    if ~isnan(z_true(1,k))
+        P_xz = P_est * H';
+        R = Rk(x_est, lambda, sigma_r, sigma_r_dot);
+        P_zz = H * P_est * H' + R;
+    
+        z_est = H * x_est;
+        K = P_xz / P_zz;  
+        x_updated = x_est + K * (z_true(:,k) - z_est);  
+        P_updated = P_est - K * P_zz * K';
+        innovation_lkf(:,k) = (z_true(:,k) - z_est);
+    else
+        x_updated = x_est;
+        P_updated = P_est;
+    end
+
+    x_lkf(:,k) = x_updated;  
+    P_lkf(:,:,k) = P_updated;
+    sr_updated_lkf(:,k) = abs(max(eig(P_updated)));
+    nees_lkf(k) = (x_lkf(:,k) - x_true(:,k))' * inv(P_lkf(:,:,k)) * (x_lkf(:,k) - x_true(:,k));
+end
+
+
+% Extended Kalman Filter
+
+x_ekf = zeros(4, N+1);
+P_ekf = zeros(4, 4, N+1);
+innovation_ekf = NaN(3, N+1);
+sr_est_ekf = zeros(1, N+1);
+sr_updated_ekf = zeros(1, N+1);
+nees_ekf = zeros(1, N+1);
+
+x_ekf(:,1) = 0.95*[0;   0;   60000;    -800*(5/18)];
+P_ekf(:,:,1) = eye(4);
+sr_est_ekf(:,1) = abs(max(eig(P_ekf(:,:,1))));
+sr_updated_ekf(:,1) = abs(max(eig(P_ekf(:,:,1))));
+
+
+for k = 2:N+1
+    x_est = F * x_ekf(:,k-1);
+    P_est = F * P_ekf(:,:,k-1) * F' + G * Q * G';
+    sr_est_ekf(:,k) = abs(max(eig(P_est)));
+
+
+    if ~isnan(z_true(1,k))
+        H = H_func(x_est);
+        P_xz = P_est * H';
+        R = Rk(x_est, lambda, sigma_r, sigma_r_dot);
+        P_zz = H * P_est * H' + R;
+    
+        z_est = H * x_est;
+        K = P_xz / P_zz;  
+        x_updated = x_est + K * (z_true(:,k) - z_est);  
+        P_updated = P_est - K * P_zz * K';
+        innovation_ekf(:,k) = (z_true(:,k) - z_est);
+    else
+        x_updated = x_est;
+        P_updated = P_est;
+    end
+
+    x_ekf(:,k) = x_updated;  
+    P_ekf(:,:,k) = P_updated;  
+    sr_updated_ekf(:,k) = abs(max(eig(P_updated)));
+    nees_ekf(k) = (x_ekf(:,k) - x_true(:,k))' * inv(P_ekf(:,:,k)) * (x_ekf(:,k) - x_true(:,k));
+end
+
+
+% Unscented Kalman Filter
+
+x_ukf = zeros(4, N+1);
+P_ukf = zeros(4, 4, N+1);
+sr_est_ukf = zeros(1, N+1);
+sr_updated_ukf = zeros(1, N+1);
+nees_ukf = zeros(1, N+1);
+
+x_ukf(:,1) = 0.95*[0; 0; 60000; -800*(5/18)];
+P_ukf(:,:,1) = eye(4);
+sr_est_ukf(:,1) = abs(max(eig(P_ukf(:,:,1))));
+sr_updated_ukf(:,1) = abs(max(eig(P_ukf(:,:,1))));
+
+kappa = 1;
+nx = 4;
+rho = nx + kappa;
+nu_i = 0.5/rho;
+nu_0 = kappa/rho;
+
+for k = 2:N+1
+
+    x_prev = x_ukf(:,k-1);
+    P_prev = P_ukf(:,:,k-1);
+
+    sigma_points = zeros(nx, (2*nx+1));
+    sigma_points(:, 1) = x_prev;
+    P_prev = (P_prev + P_prev') / 2;
+    P_prev = P_prev + eye(nx) * 1e-9;
+    sqrt_P = chol(P_prev, "lower");
+    
+    for i = 1:nx
+        sigma_points(:, i+1) = x_prev + sqrt(rho) * sqrt_P(:, i);
+        sigma_points(:, i+nx+1) = x_prev - sqrt(rho) * sqrt_P(:, i);
+    end
+
+    x_est_points = F * sigma_points;
+    x_est = nu_0 * x_est_points(:, 1) + nu_i * sum(x_est_points(:, 2:end), 2);
+
+    P_est = nu_0*((x_est_points(:, 1)-x_est)*(x_est_points(:, 1)-x_est)');
+
+    for j = 2:2*nx+1
+        P_est = P_est + nu_i * ((x_est_points(:, j)-x_est)*(x_est_points(:, j)-x_est)');
+    end 
+
+    P_est = P_est + G*Q*G';
+    sr_est_ukf(:,k) = abs(max(eig(P_est)));
+
+    if ~isnan(z_true(1, k))
+
+        z_est_points = zeros(3, 2*nx + 1);
+        for i = 1:(2*nx+1)
+            z_est_points(:, i) = hx_func(x_est_points(:, i));
+        end
+
+        z_est = nu_0 * z_est_points(:, 1) + nu_i * sum(z_est_points(:, 2:end), 2);
+
+        R = Rk(x_est, lambda, sigma_r, sigma_r_dot);
+
+        P_zz = nu_0 * ((z_est_points(:, 1)-z_est)*(z_est_points(:, 1)-z_est)') + R;
+        P_xz = nu_0 * ((x_est_points(:, 1)-x_est)*(z_est_points(:, 1)-z_est)');
+
+        for j = 2:(2*nx+1)
+            P_zz = P_zz + nu_i * ((z_est_points(:, j) - z_est) * (z_est_points(:, j) - z_est)');
+            P_xz = P_xz + nu_i * ((x_est_points(:, j) - x_est) * (z_est_points(:, j) - z_est)');
+        end
+
+        
+        K = P_xz / P_zz;
+        x_updated = x_est + K * (z_true(:, k) - z_est);
+        P_updated = P_est - K * P_zz * K';
+    else
+        x_updated = x_est;
+        P_updated = P_est;
+    end
+    
+    x_ukf(:, k) = x_updated; 
+    P_ukf(:, :, k) = P_updated;
+    sr_updated_ukf(:,k) = abs(max(eig(P_updated)));
+    nees_ukf(k) = (x_ukf(:,k) - x_true(:,k))' * inv(P_ukf(:,:,k)) * (x_ukf(:,k) - x_true(:,k));
+end
+
+% Particle Filter
+
+N_U = 2000;
+N_BZ = 2000;
+P0 = eye(4);
+x_U = repmat(x_true(:,1), 1, N_U) + sqrt(P0) * randn(4, N_U);
+w_U = ones(1, N_U) / N_U;
+P_pf = zeros(4, 4, N+1);
+P_pf(:,:,1) = P0;
+sr_updated_pf = zeros(1, N+1);
+nees_pf = zeros(1, N+1);
+
+x_BZ = zeros(4, N_BZ);
+w_BZ = zeros(1, N_BZ);
+
+p_U = 1;
+p_BZ = 0;
+
+x_pf = zeros(4, N+1);
+x_pf(:,1) = sum(x_U .* w_U, 2);
+x_U_prev = x_U;
+
+for k = 2:N+1
+
+    noise_U = sigma_w * randn(2, N_U);
+    x_U = F * x_U_prev + G * noise_U;
+
+    if p_BZ > 0
+        for i = 1:N_BZ
+            valid = false;
+            while ~valid
+                noise_BZ = sigma_w * randn(2,1);
+                temp_x = F * x_BZ(:, i) + G * noise_BZ;
+                temp_obs = hx_func(temp_x);
+
+                if abs(temp_obs(3)) <= L
+                    x_BZ(:, i) = temp_x;
+                    valid = true;
+                end
+            end
+        end
+    end
+
+    if ~isnan(z_true(1,k))
+        p_U = 1;
+        p_BZ = 0;
+
+        for i = 1:N_U
+            z_pred = hx_func(x_U(:,i));
+            R_p = Rk(x_U(:,i), lambda, sigma_r, sigma_r_dot);
+
+            inn = z_true(:,k) - z_pred;
+            likelihood = (1 / sqrt((2*pi)^3 * det(R_p))) * exp(-0.5 * (inn' * (R_p \ inn)));
+            w_U(i) = w_U(i) * likelihood;
+        end
+
+        w_U = w_U / sum(w_U);
+        edges = min([0, cumsum(w_U)], 1); edges(end) = 1;
+        [~, idx] = histc(rand(1, N_U), edges);
+        x_U = x_U(:, idx);
+        w_U = ones(1, N_U) / N_U;
+
+    elseif isnan(z_true(1,k)) && p_BZ == 0
+        pi_w = zeros(1, N_U);
+        for i = 1:N_U
+            mu = F * x_U_prev(:, i);
+            mu_obs = hx_func(mu);
+
+            if abs(mu_obs(3)) <= L
+                pi_w(i) = 1;
+            else 
+                pi_w(i) = 0;
+            end
+        end
+        pi_w = pi_w / sum(pi_w);
+
+        edges = min([0, cumsum(pi_w)], 1); edges(end) = 1;
+        [~, idx] = histc(rand(1, N_BZ), edges);
+        seeds = x_U_prev(:, idx);
+
+        for i = 1:N_BZ
+            valid = false;
+            while ~valid
+                noise_BZ = sigma_w * randn(2, 1);
+                temp_x = F * seeds(:, i) + G * noise_BZ;
+                temp_obs = hx_func(temp_x);
+
+                if abs(temp_obs(3)) <= L
+                    x_BZ(:, i) = temp_x;
+                    valid = true;
+                end
+            end
+        end
+
+        w_BZ = ones(1, N_BZ) / N_BZ;
+        p_U = 0;
+        p_BZ = 1;
+
+    else 
+        w_BZ = ones(1, N_BZ) / N_BZ;
+        w_U  = ones(1, N_U) / N_U;
+
+        p_U = 0;
+        p_BZ = 1;
+
+    end
+
+    x_U_prev = x_U;
+
+    mean_U  = sum(x_U .* w_U, 2);
+    mean_BZ = sum(x_BZ .* w_BZ, 2);
+
+    x_pf(:,k) = p_U * mean_U + p_BZ * mean_BZ;
+
+    dev_U  = x_U  - mean_U;
+    dev_BZ = x_BZ - mean_BZ;
+    
+    P_U  = dev_U  * diag(w_U)  * dev_U';
+    P_BZ = dev_BZ * diag(w_BZ) * dev_BZ';
+    
+    P_pf(:,:,k) = p_U  * (P_U) + p_BZ * (P_BZ);
+    sr_updated_pf(k) = abs(max(eig(P_pf(:,:,k))));
+    nees_pf(k) = (x_pf(:,k) - x_true(:,k))' * inv(P_pf(:,:,k)) * (x_pf(:,k) - x_true(:,k));
+
+end
+
+
+time_steps = 1:(N+1);
+
+
+figure();
+plot(x_true(1,:), x_true(3,:), 'k-', 'LineWidth', 2); 
+hold on; grid on; axis equal;
+
+% Plot raw sensor measurements (only the ones that weren't blind)
+scatter(z_true(1,:), z_true(2,:), 15, 'm', 'filled', 'MarkerFaceAlpha', 0.5);
+
+% Plot the three filters
+plot(x_lkf(1,:), x_lkf(3,:), 'b-.', 'LineWidth', 1.5);
+plot(x_ekf(1,:), x_ekf(3,:), 'g--', 'LineWidth', 1.5);
+plot(x_ukf(1,:), x_ukf(3,:), 'r-', 'LineWidth', 1.5);
+plot(x_pf(1,:), x_pf(3,:), 'y-', 'LineWidth', 1.5);
+
+xlabel('X Position (m)');
+ylabel('Y Position (m)');
+title('Target Tracking: True vs Estimated Trajectories');
+legend('True Trajectory', 'Radar Measurements', 'LKF', 'EKF', 'UKF', 'Location', 'Best');
+
+
+
+state_names_x = {'X Position (m)', 'X Velocity (m/s)', ...
+               'Y Position (m)', 'Y Velocity (m/s)'};
+
+figure();
+
+for i = 1:4
+    subplot(2, 2, i); 
+    hold on; 
+    grid on; 
+    
+    plot(time_steps, x_true(i,:), 'k-',  'LineWidth', 2.0, 'DisplayName', 'True');
+    plot(time_steps, x_lkf(i,:),  'b-.', 'LineWidth', 1.5, 'DisplayName', 'LKF');
+    plot(time_steps, x_ekf(i,:),  'g--', 'LineWidth', 1.5, 'DisplayName', 'EKF');
+    plot(time_steps, x_ukf(i,:),  'r-',  'LineWidth', 1.5, 'DisplayName', 'UKF');
+    plot(time_steps, x_pf(i,:),   'm-.', 'LineWidth', 1.5, 'DisplayName', 'PF');
+    
+    title(state_names_x{i});
+    xlabel('Time Step (k)');
+    ylabel(state_names_x{i});
+    legend();
+end
+
+state_names_z = {'X Position (m)', ...
+               'Y Position (m)', 'R_Dot Range Rate (m/s)'};
+
+
+figure();
+
+for i = 1:3
+    subplot(3, 1, i);
+    hold on;
+    grid on;
+
+    plot(time_steps, innovation_lkf(i,:), 'k-',  'LineWidth', 2.0, 'DisplayName', 'LKF Innovation')
+    plot(time_steps, innovation_ekf(i,:), 'b-',  'LineWidth', 2.0, 'DisplayName', 'EKF Innovation')
+    
+    title(state_names_z{i});
+    xlabel('Time Step (k)');
+    ylabel(state_names_z{i});
+    legend();
+
+end
+
+figure();
+
+hold on;
+grid on;
+plot(time_steps, sr_est_lkf, 'LineWidth', 2.0, 'DisplayName', 'LKF Estimated Spectral Radii');
+plot(time_steps, sr_updated_lkf, 'LineWidth', 2.0, 'DisplayName', 'LKF Updated Spectral Radii');
+plot(time_steps, sr_est_ekf, 'LineWidth', 2.0, 'DisplayName', 'EKF Estimated Spectral Radii');
+plot(time_steps, sr_updated_ekf, 'LineWidth', 2.0, 'DisplayName', 'EKF Updated Spectral Radii');
+plot(time_steps, sr_est_ukf, 'LineWidth', 2.0, 'DisplayName', 'UKF Estimated Spectral Radii');
+plot(time_steps, sr_updated_ukf, 'LineWidth', 2.0, 'DisplayName', 'UKF Updated Spectral Radii');
+plot(time_steps, sr_updated_pf, 'LineWidth', 2.0, 'DisplayName', 'PF Updated Spectral Radii');
+
+title('Spectral Radii');
+
+xlabel('Time Step (k)');
+ylabel('Spectral Radii');
+legend();
+
+figure();
+
+for i = 1:4
+    subplot(2, 2, i);
+    hold on; 
+    grid on;
+    
+    err_lkf = x_lkf(i,:) - x_true(i,:);
+    bnd_lkf = 3 * squeeze(sqrt(P_lkf(i,i,:)))';
+    plot(time_steps, err_lkf, 'b-', 'LineWidth', 1.2, 'DisplayName', 'LKF Error');
+    plot(time_steps, bnd_lkf, 'b--', 'DisplayName', 'LKF \pm3\sigma');
+    plot(time_steps, -bnd_lkf, 'b--', 'HandleVisibility', 'off');
+    
+    err_ekf = x_ekf(i,:) - x_true(i,:);
+    bnd_ekf = 3 * squeeze(sqrt(P_ekf(i,i,:)))';
+    plot(time_steps, err_ekf, 'g-', 'LineWidth', 1.2, 'DisplayName', 'EKF Error');
+    plot(time_steps, bnd_ekf, 'g--', 'DisplayName', 'EKF \pm3\sigma');
+    plot(time_steps, -bnd_ekf, 'g--', 'HandleVisibility', 'off');
+    
+    err_ukf = x_ukf(i,:) - x_true(i,:);
+    bnd_ukf = 3 * squeeze(sqrt(P_ukf(i,i,:)))';
+    plot(time_steps, err_ukf, 'r-', 'LineWidth', 1.2, 'DisplayName', 'UKF Error');
+    plot(time_steps, bnd_ukf, 'r--', 'DisplayName', 'UKF \pm3\sigma');
+    plot(time_steps, -bnd_ukf, 'r--', 'HandleVisibility', 'off');
+
+    err_pf = x_pf(i,:) - x_true(i,:);
+    bnd_pf = 3 * squeeze(sqrt(P_pf(i,i,:)))';
+    plot(time_steps, err_pf, 'm-', 'LineWidth', 1.2, 'DisplayName', 'PF Error');
+    plot(time_steps, bnd_pf, 'm--', 'DisplayName', 'PF \pm3\sigma');
+    plot(time_steps, -bnd_pf, 'm--', 'HandleVisibility', 'off');
+    
+    title(['Estimation Error and \pm3\sigma Bounds for State', state_names_x(i)]);
+    xlabel('Time Step (k)'); ylabel('Error');
+    legend();
+end
+
+rmse_lkf = sqrt(mean((x_lkf - x_true).^2, 2));
+rmse_ekf = sqrt(mean((x_ekf - x_true).^2, 2));
+rmse_ukf = sqrt(mean((x_ukf - x_true).^2, 2));
+rmse_pf  = sqrt(mean((x_pf - x_true).^2, 2));
+
+RMSE_Table = table(rmse_lkf, rmse_ekf, rmse_ukf, rmse_pf,...
+        'RowNames', {'X_Pos', 'X_Vel', 'Y_Pos', 'Y_Vel'},...
+        'VariableNames', {'LKF', 'EKF', 'UKF', 'PF'});
+
+disp(RMSE_Table);
+
+alpha = 0.05;
+n_x = 4;
+zeta1 = chi2inv(alpha, n_x); 
+zeta2 = chi2inv(1 - alpha, n_x);
+
+figure();
+hold on; grid on;
+plot(time_steps(2:end), nees_lkf(2:end), 'b-', 'LineWidth', 1.2, 'DisplayName', 'LKF');
+plot(time_steps(2:end), nees_ekf(2:end), 'g-', 'LineWidth', 1.2, 'DisplayName', 'EKF');
+plot(time_steps(2:end), nees_ukf(2:end), 'r-', 'LineWidth', 1.2, 'DisplayName', 'UKF');
+plot(time_steps(2:end), nees_pf(2:end), 'y-', 'LineWidth', 1.2, 'DisplayName', 'PF');
+
+yline(zeta1, 'k--', ['\zeta_1 = ', num2str(zeta1)], 'LineWidth', 2, 'LabelHorizontalAlignment', 'left', 'HandleVisibility', 'off');
+yline(zeta2, 'k--', ['\zeta_2 = ', num2str(zeta2)], 'LineWidth', 2, 'LabelHorizontalAlignment', 'left', 'HandleVisibility', 'off');
+
+set(gca, 'YScale', 'log');
+title('Normalized Estimation Error Squared (NEES) \beta_n');
+xlabel('Time Step (k)'); ylabel('NEES (Log Scale)');
+legend();
+
+frac_lkf = sum(nees_lkf(2:end) > zeta2 | nees_lkf(2:end) < zeta1) / N;
+frac_ekf = sum(nees_ekf(2:end) > zeta2 | nees_ekf(2:end) < zeta1) / N;
+frac_ukf = sum(nees_ukf(2:end) > zeta2 | nees_ukf(2:end) < zeta1) / N;
+frac_pf = sum(nees_pf(2:end) > zeta2 | nees_pf(2:end) < zeta1) / N;
+
+disp(' ');
+fprintf('LKF: %.4f\n', frac_lkf);
+fprintf('EKF: %.4f\n', frac_ekf);
+fprintf('UKF: %.4f\n', frac_ukf);
+fprintf('PF: %.4f\n', frac_pf);
